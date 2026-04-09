@@ -1,10 +1,18 @@
+import os
+
 from fastapi import FastAPI
+from openai import OpenAI
 from pydantic import BaseModel
 from typing import List, Dict, Any
 import re
 import json
 
 app = FastAPI(title="AI阅卷服务")
+
+client = OpenAI(
+    api_key=os.getenv("DASHSCOPE_API_KEY"),
+    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+)
 
 
 class GradeRequest(BaseModel):
@@ -65,16 +73,51 @@ def score_text(question_id: str, text: str):
 
 def recognize_answer_with_model(image_base64: str, question_id: str) -> str:
     """
-    这里替换成真正的 OCR/多模态模型调用。
-    当前先返回模拟结果，方便联调。
+    用 Qwen Omni 识别学生手写答案，只返回转写文本。
+    image_base64: 形如 data:image/png;base64,xxxx 或纯 base64 字符串
     """
+    model_name = "qwen3.5-omni-plus-2026-03-15"
 
-    # ====== 你联调前端时先用这个假数据 ======
-    mock_results = {
-        "26-2": " 就业困难 交通拥挤",
-        "26-3": "城镇加快发展 吸引农村人口 增加绿化面积"
-    }
-    return mock_results.get(question_id, "")
+    # 兼容 data URL / 纯 base64
+    if image_base64.startswith("data:"):
+        image_url = image_base64
+    else:
+        image_url = f"data:image/png;base64,{image_base64}"
+
+    prompt = f"""
+你是考试手写答案识别助手。
+当前题号：{question_id}
+
+请只做一件事：准确转写图片中的学生手写中文答案。
+要求：
+1. 只输出识别后的答案文本
+2. 不要解释
+3. 不要打分
+4. 不要补充图片中没有的内容
+5. 多个要点之间用空格分隔
+6. 如果有不确定的字，尽量按上下文识别
+"""
+
+    resp = client.chat.completions.create(
+        model=model_name,
+        messages=[
+            {"role": "system", "content": "你是一个擅长识别中文手写考试答案的助手。"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt.strip()},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": image_url}
+                    }
+                ]
+            }
+        ],
+        temperature=0
+    )
+
+    text = resp.choices[0].message.content.strip()
+    return text
 
 
 @app.get("/health")

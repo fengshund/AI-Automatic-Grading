@@ -10,7 +10,7 @@ import json
 app = FastAPI(title="AI阅卷服务")
 
 client = OpenAI(
-    api_key=os.getenv("DASHSCOPE_API_KEY"),
+    api_key="sk-af81990cf09d495595bbc6df873dae62",
     base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
 )
 
@@ -72,52 +72,66 @@ def score_text(question_id: str, text: str):
 
 
 def recognize_answer_with_model(image_base64: str, question_id: str) -> str:
-    """
-    用 Qwen Omni 识别学生手写答案，只返回转写文本。
-    image_base64: 形如 data:image/png;base64,xxxx 或纯 base64 字符串
-    """
-    model_name = "qwen3.5-omni-plus-2026-03-15"
+    try:
+        if not image_base64.startswith("data:"):
+            image_base64 = f"data:image/png;base64,{image_base64}"
 
-    # 兼容 data URL / 纯 base64
-    if image_base64.startswith("data:"):
-        image_url = image_base64
-    else:
-        image_url = f"data:image/png;base64,{image_base64}"
+        prompt = f"""
+        你是考试手写答案识别助手。
 
-    prompt = f"""
-你是考试手写答案识别助手。
-当前题号：{question_id}
+        请只转写学生手写作答内容，忽略以下内容：
+        1. 题号，如“(2)”“(3)”
+        2. 分值，如“(4分)”
+        3. 非当前小问的作答内容
+        4. 题干、序号、括号编号，如“①②③”
+        5. 页面上的其他印刷文字
 
-请只做一件事：准确转写图片中的学生手写中文答案。
-要求：
-1. 只输出识别后的答案文本
-2. 不要解释
-3. 不要打分
-4. 不要补充图片中没有的内容
-5. 多个要点之间用空格分隔
-6. 如果有不确定的字，尽量按上下文识别
-"""
+        要求：
+        1. 只输出当前小问的学生答案文字
+        2. 不要输出题号、分值、括号、序号
+        3. 不要解释，不要打分
+        4. 多个要点之间用空格分隔
+        5. 如果图片中出现多个小问，只识别最上方这一个小问的答案
+        当前小题题号：{question_id}
+        """.strip()
 
-    resp = client.chat.completions.create(
-        model=model_name,
-        messages=[
-            {"role": "system", "content": "你是一个擅长识别中文手写考试答案的助手。"},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt.strip()},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": image_url}
-                    }
-                ]
-            }
-        ],
-        temperature=0
-    )
+        stream = client.chat.completions.create(
+            model="qwen3.5-flash",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": image_base64}
+                        },
+                        {
+                            "type": "text",
+                            "text": prompt
+                        }
+                    ]
+                }
+            ],
+            stream=True,
+            stream_options={"include_usage": True},
+            temperature=0
+        )
 
-    text = resp.choices[0].message.content.strip()
-    return text
+        parts = []
+        for chunk in stream:
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            if delta and getattr(delta, "content", None):
+                parts.append(delta.content)
+
+        text = "".join(parts).strip()
+        if not text:
+            raise RuntimeError("模型返回为空")
+        return text
+
+    except Exception as e:
+        raise RuntimeError(f"模型识别失败: {e}")
 
 
 @app.get("/health")

@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         AI半自动阅卷助手
 // @namespace    http://tampermonkey.net/
-// @version      0.6
-// @description  读取当前题图片，调用本地AI评分服务，半自动打分与提交
+// @version      0.7
+// @description  读取当前题图片，调用本地AI评分服务，支持自动循环打分提交
 // @match        http://sd-pt.cn/web/main.jsp*
 // @grant        GM_xmlhttpRequest
 // @connect      127.0.0.1
@@ -15,6 +15,15 @@
 
   const API_URL = 'http://127.0.0.1:8000/grade';
   const DEFAULT_QUESTION_ID = '26-2';
+
+  const AUTO_WAIT_AFTER_SUBMIT = 2500;   // 提交后等待页面自动跳转
+  const AUTO_WAIT_BETWEEN_ROUNDS = 1200; // 每轮间隔
+  const MAX_SAME_IMAGE_RETRY = 8;        // 防止页面没跳转时死循环
+
+  let autoRunning = false;
+  let autoRound = 0;
+  let lastProcessedImageUrl = '';
+  let sameImageCount = 0;
 
   function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
@@ -191,6 +200,8 @@
         <button id="ai-run-btn" type="button">AI评分</button>
         <button id="ai-fill-btn" type="button">填分</button>
         <button id="ai-submit-btn" type="button">提交</button>
+        <button id="ai-auto-start-btn" type="button">开始自动</button>
+        <button id="ai-auto-stop-btn" type="button">停止自动</button>
         <button id="ai-debug-btn" type="button">找图</button>
         <button id="ai-close-btn" type="button">关</button>
       </div>
@@ -308,6 +319,8 @@
       #ai-run-btn { background: #16a085; }
       #ai-fill-btn { background: #2980b9; }
       #ai-submit-btn { background: #8e44ad; }
+      #ai-auto-start-btn { background: #27ae60; }
+      #ai-auto-stop-btn { background: #d35400; }
       #ai-debug-btn { background: #c0392b; }
       #ai-close-btn { background: #7f8c8d; }
     `;
@@ -359,27 +372,34 @@
     panel.querySelector('#ai-toggle-btn').textContent = '收起';
   }
 
+  async function gradeCurrentQuestion() {
+    setStatus('查找图片...');
+    const imageUrl = await getImageUrl();
+
+    setStatus('下载图片...');
+    const imageBase64 = await imageToBase64FromImgUrl(imageUrl);
+
+    setStatus('AI评分中...');
+    const payload = {
+      question_id: DEFAULT_QUESTION_ID,
+      image_base64: imageBase64
+    };
+
+    const result = await requestGrade(payload);
+    if (!result.success) {
+      throw new Error(result.message || '未知错误');
+    }
+
+    return {
+      ...result,
+      imageUrl
+    };
+  }
+
   async function runAiMarking() {
     try {
       showPanel();
-      setStatus('查找图片...');
-      const imageUrl = await getImageUrl();
-
-      setStatus('下载图片...');
-      const imageBase64 = await imageToBase64FromImgUrl(imageUrl);
-
-      setStatus('AI评分中...');
-      const payload = {
-        question_id: DEFAULT_QUESTION_ID,
-        image_base64: imageBase64
-      };
-
-      const result = await requestGrade(payload);
-
-      if (!result.success) {
-        throw new Error(result.message || '未知错误');
-      }
-
+      const result = await gradeCurrentQuestion();
       setResult(result);
       expandDetails();
       setStatus('完成');
@@ -427,11 +447,128 @@
     }
   }
 
+async function processCurrentQuestionAuto() {
+  const result = await gradeCurrentQuestion();
+  setResult(result);
+  expandDetails();
+
+  if (result.should_auto_submit === false) {
+    throw new Error(
+      '后端判定不宜自动提交：' + ((result.risk_flags || []).join('、') || '未知原因')
+    );
+  }
+
+  const score = result?.score;
+  if (score === undefined || score === null || score === '') {
+    throw new Error('后端未返回有效分数');
+  }
+
+  setStatus(`自动填分：${score}`);
+  setScore(score);
+
+  await sleep(500);
+
+  setStatus(`自动提交：${score}`);
+  submitScore();
+
+  return result;
+}
+
+  async function waitForNextQuestion(previousImageUrl) {
+    const start = Date.now();
+    while (Date.now() - start < 15000) {
+      try {
+        const currentImageUrl = await getImageUrl();
+        if (currentImageUrl && currentImageUrl !== previousImageUrl) {
+          return currentImageUrl;
+        }
+      } catch (e) {}
+      await sleep(500);
+    }
+    return null;
+  }
+
+  async function autoLoop() {
+    showPanel();
+    setStatus('自动模式运行中...');
+
+    while (autoRunning) {
+      try {
+        autoRound += 1;
+        setStatus(`自动第 ${autoRound} 题：评分中...`);
+
+        const result = await processCurrentQuestionAuto();
+
+        const currentImageUrl = result.imageUrl || '';
+        if (currentImageUrl) {
+          if (currentImageUrl === lastProcessedImageUrl) {
+            sameImageCount += 1;
+          } else {
+            lastProcessedImageUrl = currentImageUrl;
+            sameImageCount = 0;
+          }
+        }
+
+        if (sameImageCount >= MAX_SAME_IMAGE_RETRY) {
+          throw new Error('连续多次检测到同一张图片，疑似未跳转，已停止');
+        }
+
+        setStatus(`第 ${autoRound} 题已提交，等待下一题...`);
+        await sleep(AUTO_WAIT_AFTER_SUBMIT);
+
+        const nextImageUrl = await waitForNextQuestion(currentImageUrl);
+
+        if (!autoRunning) break;
+
+        if (nextImageUrl) {
+          lastProcessedImageUrl = nextImageUrl;
+          sameImageCount = 0;
+          setStatus(`已进入下一题，准备继续...`);
+          await sleep(AUTO_WAIT_BETWEEN_ROUNDS);
+        } else {
+          throw new Error('提交后长时间未检测到下一题，已停止');
+        }
+
+      } catch (e) {
+        console.error(e);
+        autoRunning = false;
+        setStatus('自动模式已停止：' + e.message);
+        break;
+      }
+    }
+
+    if (!autoRunning) {
+      setStatus(`自动模式停止，共处理 ${autoRound} 题`);
+    }
+  }
+
+  function startAutoMode() {
+    if (autoRunning) {
+      setStatus('自动模式已在运行');
+      return;
+    }
+
+    autoRunning = true;
+    autoRound = 0;
+    sameImageCount = 0;
+    lastProcessedImageUrl = '';
+
+    setStatus('自动模式启动中...');
+    autoLoop();
+  }
+
+  function stopAutoMode() {
+    autoRunning = false;
+    setStatus(`正在停止自动模式...`);
+  }
+
   function bindPanelEvents() {
     const panel = ensurePanel();
     panel.querySelector('#ai-run-btn').onclick = runAiMarking;
     panel.querySelector('#ai-fill-btn').onclick = fillScoreFromPanel;
     panel.querySelector('#ai-submit-btn').onclick = submitFromPanel;
+    panel.querySelector('#ai-auto-start-btn').onclick = startAutoMode;
+    panel.querySelector('#ai-auto-stop-btn').onclick = stopAutoMode;
     panel.querySelector('#ai-debug-btn').onclick = debugFindImage;
   }
 

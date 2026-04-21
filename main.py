@@ -1,4 +1,6 @@
 import os
+import traceback
+
 from criteria import RUBRICS
 from fastapi import FastAPI
 from openai import OpenAI
@@ -20,7 +22,12 @@ client = OpenAI(
 class GradeRequest(BaseModel):
     question_id: str
     image_base64: str
+from datetime import datetime
+import json
 
+def append_log(record: dict, path: str = "grading_log.jsonl"):
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 def normalize_text(text: str) -> str:
     if not text:
@@ -356,11 +363,66 @@ def recognize_answer_with_model(image_base64: str, question_id: str) -> str:
     except Exception as e:
         raise RuntimeError(f"模型识别失败: {e}")
 
+def decide_auto_submit(scored: dict, question_id: str) -> dict:
+    """
+    根据评分结果决定是否允许前端自动提交。
+    注意：
+    1. 空白答案允许自动 0 分提交
+    2. 真正要拦截的是异常情况，而不是单纯低分/空白
+    """
+    risk_flags = []
 
+    text = (scored.get("recognized_text") or "").strip()
+    scoring = scored.get("scoring") or []
+    matched_points = scored.get("matched_points") or []
+    total_score = scored.get("total_score", 0)
+
+    # 1) 串题风险：识别到下一问题号
+    if "(3)" in text or "（3）" in text or "(4)" in text or "（4）" in text:
+        risk_flags.append("疑似串入下一问")
+
+    # 2) 文本过长：通常意味着截图范围过大，混入别的小问
+    if len(text) > 120:
+        risk_flags.append("识别文本过长，疑似包含多问")
+
+    # 3) 评分明细异常：有文本但模型没给出有效 scoring
+    if text and not scoring:
+        risk_flags.append("有识别文本但无评分明细")
+
+    # 4) 分数异常
+    rubric = RUBRICS[question_id]
+    if total_score < 0 or total_score > rubric["max_score"]:
+        risk_flags.append("分数超出范围")
+
+    # 5) 简单置信度：不是模型自评，而是后端规则分
+    # 空白卷视为高可自动化，因为 0 分是稳定结果
+    if not text:
+        auto_confidence = 0.98
+    elif risk_flags:
+        auto_confidence = 0.35
+    elif total_score == 0 and text:
+        auto_confidence = 0.88
+    elif len(matched_points) >= 2:
+        auto_confidence = 0.93
+    else:
+        auto_confidence = 0.86
+
+    should_auto_submit = len(risk_flags) == 0
+
+    return {
+        "auto_confidence": auto_confidence,
+        "should_auto_submit": should_auto_submit,
+        "risk_flags": risk_flags
+    }
 @app.get("/health")
 def health():
     return {"ok": True}
+from datetime import datetime
+import json
 
+def append_log(record: dict, path: str = "grading_log.jsonl"):
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 @app.post("/grade")
 def grade(req: GradeRequest):
@@ -377,7 +439,16 @@ def grade(req: GradeRequest):
             question_id=req.question_id,
             recognized_text=recognized_text
         )
-
+        auto_meta = decide_auto_submit(scored, req.question_id)
+        append_log({
+            "time": datetime.now().isoformat(timespec="seconds"),
+            "question_id": req.question_id,
+            "recognized_text": scored["recognized_text"],
+            "matched_points": scored["matched_points"],
+            "score": scored["total_score"],
+            "should_auto_submit": auto_meta["should_auto_submit"],
+            "risk_flags": auto_meta["risk_flags"]
+        })
         return {
             "success": True,
             "question_id": req.question_id,
@@ -389,6 +460,53 @@ def grade(req: GradeRequest):
         }
 
     except Exception as e:
+        return {
+            "success": False,
+            "message": str(e)
+        }
+
+@app.post("/grade")
+def grade(req: GradeRequest):
+    try:
+        # 第一次调用：识别
+        recognized_text = recognize_answer_with_model(
+            image_base64=req.image_base64,
+            question_id=req.question_id
+        )
+        recognized_text = clean_recognized_text(recognized_text)
+
+        # 第二次调用：评分
+        scored = score_with_model(
+            question_id=req.question_id,
+            recognized_text=recognized_text
+        )
+
+        # 自动判定
+        auto_meta = decide_auto_submit(scored, req.question_id)
+        append_log({
+            "time": datetime.now().isoformat(timespec="seconds"),
+            "question_id": req.question_id,
+            "recognized_text": scored["recognized_text"],
+            "matched_points": scored["matched_points"],
+            "score": scored["total_score"],
+            "should_auto_submit": auto_meta["should_auto_submit"],
+            "risk_flags": auto_meta["risk_flags"]
+        })
+        return {
+            "success": True,
+            "question_id": req.question_id,
+            "recognized_text": scored["recognized_text"],
+            "matched_points": scored["matched_points"],
+            "score": scored["total_score"],
+            "reason": scored["summary_reason"],
+            "scoring_detail": scored["scoring"],
+            "auto_confidence": auto_meta["auto_confidence"],
+            "should_auto_submit": auto_meta["should_auto_submit"],
+            "risk_flags": auto_meta["risk_flags"]
+        }
+
+    except Exception as e:
+        traceback.print_exc()
         return {
             "success": False,
             "message": str(e)
